@@ -1,0 +1,59 @@
+name: MQ Queue Management
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mqsc/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy queues'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+
+jobs:
+  apply-queue-definitions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }}
+          
+      - name: Apply Queue Definitions
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          NAMESPACE="mq-${ENV}"
+          QMGR_NAME="QM1"
+          
+          # Apply all MQSC files from the repository
+          for mqsc_file in ./mqsc/${ENV}/*.mqsc; do
+            echo "Applying $mqsc_file"
+            kubectl exec -n ${NAMESPACE} \
+              $(kubectl get pod -n ${NAMESPACE} -l app.kubernetes.io/name=ibm-mq -o jsonpath='{.items[0].metadata.name}') \
+              -- runmqsc ${QMGR_NAME} < ${mqsc_file}
+          done
+      
+      - name: Export Current Queue Definitions
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          NAMESPACE="mq-${ENV}"
+          QMGR_NAME="QM1"
+          
+          # Export current queue definitions for backup
+          kubectl exec -n ${NAMESPACE} \
+            $(kubectl get pod -n ${NAMESPACE} -l app.kubernetes.io/name=ibm-mq -o jsonpath='{.items[0].metadata.name}') \
+            -- /bin/bash -c "echo 'DISPLAY QLOCAL(*)' | runmqsc ${QMGR_NAME}" > ./exports/queues-${ENV}-$(date +%Y%m%d).txt

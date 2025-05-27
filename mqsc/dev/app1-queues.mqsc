@@ -1,0 +1,8 @@
+* My Application Queues
+DEFINE QLOCAL('MY.FIRST.QUEUE') +
+       DESCR('My first queue via GitOps') +
+       DEFPSIST(YES) +
+       MAXDEPTH(5000) +
+       REPLACE
+
+       
