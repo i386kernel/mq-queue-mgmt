@@ -5,11 +5,10 @@ on:
     branches: [main]
     paths:
       - 'mqsc/**/*.mqsc'
-      - '.github/workflows/mq-queue-management.yml'
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment to deploy queues'
+        description: 'Environment'
         required: true
         default: 'dev'
         type: choice
@@ -23,204 +22,39 @@ env:
   QMGR_NAME: secureapphelm
 
 jobs:
-  apply-queue-definitions:
+  deploy-queues:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
       
-      - name: Configure AWS credentials
-        run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws configure set region ${{ secrets.AWS_REGION }}
+      - name: Configure AWS
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-      
-      - name: Install AWS CLI and kubectl
         run: |
-          # Install AWS CLI v2
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
-          sudo ./aws/install
-          
-          # Install kubectl
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
-          
-          # Verify installations
-          aws --version
-          kubectl version --client
-          
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig \
-            --region ${{ secrets.AWS_REGION }} \
-            --name ${{ secrets.EKS_CLUSTER_NAME }}
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }}
       
       - name: Get MQ Pod
-        id: get-pod
         run: |
-          echo "Looking for MQ pod in namespace: ${{ env.MQ_NAMESPACE }}"
-          
-          # Get MQ pod name
-          MQ_POD=$(kubectl get pods -n ${{ env.MQ_NAMESPACE }} -o name | grep -i mq | head -n1 | sed 's|pod/||')
-          
-          if [ -z "$MQ_POD" ]; then
-            echo "❌ No MQ pod found in namespace ${{ env.MQ_NAMESPACE }}"
-            echo "Available pods:"
-            kubectl get pods -n ${{ env.MQ_NAMESPACE }}
-            exit 1
-          fi
-          
-          echo "Found MQ pod: $MQ_POD"
+          MQ_POD=$(kubectl get pods -n ${{ env.MQ_NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
           echo "MQ_POD=$MQ_POD" >> $GITHUB_ENV
-          
-          # Wait for pod to be ready
-          kubectl wait --for=condition=ready pod/$MQ_POD -n ${{ env.MQ_NAMESPACE }} --timeout=300s
+          echo "Found pod: $MQ_POD"
       
-      - name: Verify Queue Manager
-        run: |
-          echo "Checking queue manager '${{ env.QMGR_NAME }}' status..."
-          kubectl exec -n ${{ env.MQ_NAMESPACE }} ${{ env.MQ_POD }} -- dspmq -m ${{ env.QMGR_NAME }}
-      
-      - name: Apply Queue Definitions
+      - name: Apply Queues
         run: |
           ENV="${{ github.event.inputs.environment || 'dev' }}"
           
-          # Check if environment directory exists
-          if [ ! -d "./mqsc/${ENV}" ]; then
-            echo "❌ Error: Directory ./mqsc/${ENV} does not exist"
-            echo "Available directories:"
-            ls -la ./mqsc/
-            exit 1
-          fi
-          
-          # Count MQSC files
-          MQSC_COUNT=$(find ./mqsc/${ENV} -name "*.mqsc" -type f | wc -l)
-          
-          if [ $MQSC_COUNT -eq 0 ]; then
-            echo "❌ Error: No MQSC files found in ./mqsc/${ENV}/"
-            echo "Contents of ./mqsc/${ENV}:"
-            ls -la ./mqsc/${ENV}/
-            exit 1
-          fi
-          
-          echo "📂 Applying MQSC files from ./mqsc/${ENV}/"
-          echo "📄 Found $MQSC_COUNT MQSC files to apply"
-          
-          # Apply all MQSC files
-          SUCCESS_COUNT=0
           for mqsc_file in ./mqsc/${ENV}/*.mqsc; do
-            echo ""
-            echo "========================================="
-            echo "📄 Applying: $(basename $mqsc_file)"
-            echo "========================================="
-            
-            # Show file content (first few lines)
-            echo "Preview:"
-            head -n 10 "$mqsc_file" | grep -v "^*"
-            echo "..."
-            
-            # Apply MQSC commands
-            if kubectl exec -i -n ${{ env.MQ_NAMESPACE }} ${{ env.MQ_POD }} -- \
-              runmqsc ${{ env.QMGR_NAME }} < "$mqsc_file"; then
-              echo "✅ Successfully applied"
-              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-              echo "❌ Failed to apply"
-              exit 1
-            fi
+            echo "Applying $(basename $mqsc_file)..."
+            kubectl exec -i ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- \
+              runmqsc ${{ env.QMGR_NAME }} < "$mqsc_file"
           done
-          
-          echo ""
-          echo "========================================="
-          echo "✅ Successfully applied $SUCCESS_COUNT MQSC files"
-          echo "========================================="
       
-      - name: Verify Queues
-        run: |
-          echo "Verifying created queues..."
-          
-          # List all application queues
-          echo ""
-          echo "📋 Application Queues:"
-          kubectl exec ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- /bin/bash -c \
-            "echo 'DISPLAY QLOCAL(APP.*)' | runmqsc ${{ env.QMGR_NAME }}" | grep -E "QUEUE|CURDEPTH|MAXDEPTH" || true
-          
-          # List all system queues
-          echo ""
-          echo "📋 System Queues:"
-          kubectl exec ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- /bin/bash -c \
-            "echo 'DISPLAY QLOCAL(SYSTEM.*)' | runmqsc ${{ env.QMGR_NAME }}" | grep -E "QUEUE|CURDEPTH|MAXDEPTH" || true
-      
-      - name: Export Queue Definitions
+      - name: List Queues
         if: always()
         run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          
-          mkdir -p ./exports
-          
-          # Export all queue definitions
-          echo "Exporting queue definitions..."
-          kubectl exec -n ${{ env.MQ_NAMESPACE }} ${{ env.MQ_POD }} -- /bin/bash -c \
-            "echo 'DISPLAY QLOCAL(*) ALL' | runmqsc ${{ env.QMGR_NAME }}" \
-            > ./exports/all-queues-${ENV}-${TIMESTAMP}.txt
-          
-          # Export summary
-          kubectl exec -n ${{ env.MQ_NAMESPACE }} ${{ env.MQ_POD }} -- /bin/bash -c \
-            "echo 'DISPLAY QLOCAL(*)' | runmqsc ${{ env.QMGR_NAME }}" \
-            > ./exports/queue-summary-${ENV}-${TIMESTAMP}.txt
-          
-          echo "✅ Exported queue definitions to ./exports/"
-      
-      - name: Generate Summary Report
-        if: always()
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          
-          echo "## 📊 Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Environment:** $ENV" >> $GITHUB_STEP_SUMMARY
-          echo "- **Namespace:** ${{ env.MQ_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Queue Manager:** ${{ env.QMGR_NAME }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **MQ Pod:** ${{ env.MQ_POD }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Timestamp:** $(date)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Count queues
-          QUEUE_COUNT=$(kubectl exec -n ${{ env.MQ_NAMESPACE }} ${{ env.MQ_POD }} -- /bin/bash -c \
-            "echo 'DISPLAY QLOCAL(*)' | runmqsc ${{ env.QMGR_NAME }}" | grep -c "QUEUE(" || true)
-          
-          echo "### 📈 Queue Statistics" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total Queues:** $QUEUE_COUNT" >> $GITHUB_STEP_SUMMARY
-      
-      - name: Upload artifacts
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: mq-deployment-${{ github.event.inputs.environment || 'dev' }}-${{ github.run_number }}
-          path: |
-            ./exports/
-            ./mqsc/
-          retention-days: 30
-          if-no-files-found: warn
-      
-      - name: Display exported files (if artifact upload fails)
-        if: always()
-        run: |
-          echo "📁 Exported files:"
-          if [ -d "./exports" ]; then
-            ls -la ./exports/
-            echo ""
-            echo "📄 Queue Summary:"
-            cat ./exports/queue-summary-*.txt 2>/dev/null | head -50 || echo "No summary file found"
-          else
-            echo "No exports directory found"
-          fi
+          echo "Current queues:"
+          kubectl exec -i ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- \
+            bash -c "echo 'DISPLAY QLOCAL(*)' | runmqsc ${{ env.QMGR_NAME }}" || true
