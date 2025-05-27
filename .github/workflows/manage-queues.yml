@@ -202,10 +202,25 @@ jobs:
       
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
         with:
           name: mq-deployment-${{ github.event.inputs.environment || 'dev' }}-${{ github.run_number }}
           path: |
             ./exports/
             ./mqsc/
           retention-days: 30
+          if-no-files-found: warn
+      
+      - name: Display exported files (if artifact upload fails)
+        if: always()
+        run: |
+          echo "📁 Exported files:"
+          if [ -d "./exports" ]; then
+            ls -la ./exports/
+            echo ""
+            echo "📄 Queue Summary:"
+            cat ./exports/queue-summary-*.txt 2>/dev/null | head -50 || echo "No summary file found"
+          else
+            echo "No exports directory found"
+          fi
