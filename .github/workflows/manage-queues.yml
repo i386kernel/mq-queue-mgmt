@@ -149,14 +149,14 @@ jobs:
           # List all application queues
           echo ""
           echo "📋 Application Queues:"
-          kubectl exec -n ${{ env.MQ_NAMESPACE }} ${{ env.MQ_POD }} -- /bin/bash -c \
-            "echo 'DISPLAY QLOCAL(APP.*)' | runmqsc ${{ env.QMGR_NAME }}" | grep -E "QUEUE|CURDEPTH|MAXDEPTH"
+          kubectl exec ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- /bin/bash -c \
+            "echo 'DISPLAY QLOCAL(APP.*)' | runmqsc ${{ env.QMGR_NAME }}" | grep -E "QUEUE|CURDEPTH|MAXDEPTH" || true
           
           # List all system queues
           echo ""
           echo "📋 System Queues:"
-          kubectl exec -n ${{ env.MQ_NAMESPACE }} ${{ env.MQ_POD }} -- /bin/bash -c \
-            "echo 'DISPLAY QLOCAL(SYSTEM.*)' | runmqsc ${{ env.QMGR_NAME }}" | grep -E "QUEUE|CURDEPTH|MAXDEPTH"
+          kubectl exec ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- /bin/bash -c \
+            "echo 'DISPLAY QLOCAL(SYSTEM.*)' | runmqsc ${{ env.QMGR_NAME }}" | grep -E "QUEUE|CURDEPTH|MAXDEPTH" || true
       
       - name: Export Queue Definitions
         if: always()
