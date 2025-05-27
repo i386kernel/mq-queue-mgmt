@@ -48,7 +48,7 @@ jobs:
           
           # Verify installations
           aws --version
-          kubectl version --client --short
+          kubectl version --client
       
       - name: Configure AWS
         env:
