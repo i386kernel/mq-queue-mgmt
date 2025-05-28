@@ -10,3 +10,9 @@ DEFINE QLOCAL('MY.SECOND.QUEUE') +
        DEFPSIST(YES) +
        MAXDEPTH(5000) +
        REPLACE
+
+DEFINE QLOCAL('MY.THIRD.QUEUE') +
+       DESCR('My THIRD queue via GitOps') +
+       DEFPSIST(YES) +
+       MAXDEPTH(5000) +
+       REPLACE
