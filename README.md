@@ -1,449 +1,236 @@
-# GitHub Actions Workflow: MQ Queue Management - Line by Line Explanation
+# MQ Queue Management - Job Based Workflow
 
-## Workflow Header and Triggers
+This GitHub Actions workflow automates the deployment and management of IBM MQ queue configurations across multiple environments using Kubernetes Jobs on AWS EKS.
 
-**Line 1**: Sets the workflow name that appears in GitHub Actions UI.
-```yaml
-name: MQ Queue Management - Job Based
+## Overview
+
+The workflow provides a robust, automated solution for applying MQ Script Command (MQSC) files to IBM MQ queue managers running in Kubernetes. It includes validation, deployment, verification, and cleanup capabilities with support for multiple environments.
+
+## Features
+
+- **Multi-Environment Support**: Deploy to dev, test, and prod environments
+- **Validation**: Syntax validation of MQSC files before deployment
+- **Dry Run Mode**: Test configurations without applying changes
+- **Configuration Tracking**: Hash-based change detection and deployment records
+- **Automatic Cleanup**: Removes old ConfigMaps and Jobs
+- **Comprehensive Logging**: Detailed logs for troubleshooting
+- **Rollback Safety**: Maintains deployment history for rollback scenarios
+
+## Prerequisites
+
+### GitHub Secrets Required
+
+Configure the following secrets in your GitHub repository:
+
+| Secret Name | Description |
+|-------------|-------------|
+| `AWS_ACCESS_KEY_ID` | AWS Access Key ID for EKS access |
+| `AWS_SECRET_ACCESS_KEY` | AWS Secret Access Key |
+| `AWS_REGION` | AWS region where EKS cluster is located |
+| `EKS_CLUSTER_NAME` | Name of your EKS cluster |
+
+### Repository Structure
+
+```
+your-repo/
+├── .github/
+│   └── workflows/
+│       └── mq-queue-management.yml
+├── mqsc/
+│   ├── dev/
+│   │   ├── app-queues.mqsc
+│   │   └── queue-manager-config.mqsc
+│   ├── test/
+│   │   ├── app-queues.mqsc
+│   │   └── queue-manager-config.mqsc
+│   └── prod/
+│       ├── app-queues.mqsc
+│       └── queue-manager-config.mqsc
+└── k8s/
+    └── jobs/
+        └── (optional job configurations)
 ```
 
-**Lines 2-7**: Triggers workflow on pushes to `main` branch, but only when files in `mqsc/` directories (MQ script files) or `k8s/jobs/` directories (Kubernetes job YAML files) are changed.
-```yaml
-on:
-  push:
-    branches: [main]
-    paths:
-      - 'mqsc/**/*.mqsc'
-      - 'k8s/jobs/**/*.yaml'
-```
+### Kubernetes Requirements
 
-**Lines 8-18**: Enables manual workflow execution with an environment dropdown (dev/test/prod).
-```yaml
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Environment'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-          - dev
-          - test
-          - prod
-```
+- IBM MQ deployed on Kubernetes with Helm
+- Queue manager accessible within the cluster
+- Persistent Volume Claim for MQ data
+- Appropriate RBAC permissions for job creation
 
-**Lines 19-23**: Adds optional dry-run parameter to validate configurations without applying them.
-```yaml
-      dry_run:
-        description: 'Dry run (validate only)'
-        required: false
-        default: false
-        type: boolean
-```
+## Configuration
 
-## Environment Variables
+### Environment Variables
 
-**Lines 25-27**: Sets global environment variables for the MQ namespace and queue manager name.
+Update these variables in the workflow file to match your setup:
+
 ```yaml
 env:
-  MQ_NAMESPACE: ibm-mq-ns
-  QMGR_NAME: secureapphelm
+  MQ_NAMESPACE: ibm-mq-ns        # Kubernetes namespace for MQ resources
+  QMGR_NAME: secureapphelm       # Name of your queue manager
 ```
 
-## Job 1: Configuration Validation
+### MQSC File Structure
 
-**Lines 29-34**: Defines first job to validate configurations, running on Ubuntu with two outputs for downstream jobs.
-```yaml
-jobs:
-  validate-configs:
-    runs-on: ubuntu-latest
-    outputs:
-      config-hash: ${{ steps.hash.outputs.hash }}
-      job-name: ${{ steps.jobname.outputs.name }}
+Each environment should have its own directory under `mqsc/` containing `.mqsc` files:
+
+```bash
+# Example MQSC file content - Application Queues
+DEFINE QLOCAL('MY.FIRST.QUEUE') +
+       DESCR('My first queue via GitOps') +
+       DEFPSIST(YES) +
+       MAXDEPTH(5000) +
+       REPLACE
+
+DEFINE QLOCAL('MY.SECOND.QUEUE') +
+       DESCR('My SECOND queue via GitOps') +
+       DEFPSIST(YES) +
+       MAXDEPTH(5000) +
+       REPLACE
+
+DEFINE QLOCAL('MY.THIRD.QUEUE') +
+       DESCR('My THIRD queue via GitOps') +
+       DEFPSIST(YES) +
+       MAXDEPTH(5000) +
+       REPLACE
+
+# Additional MQSC commands examples
+ALTER QMGR MAXMSGL(104857600)
 ```
 
-**Lines 36-37**: Checks out the repository code.
-```yaml
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+## Usage
+
+### Automatic Triggers
+
+The workflow automatically runs when:
+- Changes are pushed to the `main` branch
+- Files in `mqsc/**/*.mqsc` are modified
+- Files in `k8s/jobs/**/*.yaml` are modified
+
+### Manual Execution
+
+1. Go to **Actions** tab in your GitHub repository
+2. Select **MQ Queue Management - Job Based** workflow
+3. Click **Run workflow**
+4. Configure parameters:
+   - **Environment**: Choose dev, test, or prod
+   - **Dry run**: Enable to validate without applying changes
+
+## Workflow Process
+
+### Stage 1: Validation (`validate-configs`)
+
+1. **Checkout Code**: Retrieves the latest repository content
+2. **Validate MQSC Syntax**: 
+   - Checks if environment directory exists
+   - Verifies presence of `.mqsc` files
+   - Validates basic MQSC command syntax
+3. **Generate Job Identifier**: Creates unique job name with timestamp
+4. **Generate Config Hash**: Creates 8-character hash for change tracking
+
+### Stage 2: Deployment (`deploy-queues`)
+
+1. **Setup Tools**: Installs AWS CLI and kubectl
+2. **Configure AWS**: Sets up credentials and kubeconfig for EKS
+3. **Create ConfigMap**: Stores MQSC files in Kubernetes ConfigMap
+4. **Deploy Job**: Creates and applies Kubernetes Job manifest
+5. **Wait for Completion**: Monitors job execution (max 10 minutes)
+6. **Show Logs**: Displays job logs for debugging
+7. **Verify Configuration**: Connects to queue manager for verification
+8. **Cleanup**: Removes old ConfigMaps (keeps 5 most recent)
+9. **Record Deployment**: Creates deployment record for tracking
+
+## Job Specification
+
+The Kubernetes Job created by this workflow:
+
+- **Image**: `ibmcom/mq:latest`
+- **Restart Policy**: Never
+- **Backoff Limit**: 2 retries
+- **TTL**: 300 seconds (auto-cleanup after 5 minutes)
+- **Volumes**: 
+  - ConfigMap with MQSC files
+  - Persistent volume for MQ data access
+
+## Monitoring and Troubleshooting
+
+### Viewing Deployment Status
+
+```bash
+# List recent jobs
+kubectl get jobs -n ibm-mq-ns -l app.kubernetes.io/name=mq-config-job
+
+# Check job logs
+kubectl logs job/<job-name> -n ibm-mq-ns
+
+# View deployment records
+kubectl get configmaps -n ibm-mq-ns -l app.kubernetes.io/name=deployment-record
 ```
 
-**Lines 39-41**: Starts MQSC validation step, setting environment variable (defaults to 'dev' if not provided).
-```yaml
-      - name: Validate MQSC syntax
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-```
+### Common Issues
 
-**Lines 43-47**: Checks if the environment-specific MQSC directory exists, exits with error if not found.
-```yaml
-          # Validate MQSC files exist and have basic syntax
-          if [ ! -d "./mqsc/${ENV}" ]; then
-            echo "Error: No MQSC directory found for environment ${ENV}"
-            exit 1
-          fi
-```
+| Issue | Solution |
+|-------|----------|
+| Job fails to start | Check RBAC permissions and namespace access |
+| Queue manager not ready | Verify MQ deployment status and PVC mounting |
+| MQSC syntax errors | Use dry-run mode to validate before deployment |
+| ConfigMap creation fails | Check namespace permissions and resource quotas |
 
-**Lines 49-53**: Verifies that .mqsc files exist in the environment directory.
-```yaml
-          # Check for MQSC files
-          if [ -z "$(find ./mqsc/${ENV} -name '*.mqsc' -type f)" ]; then
-            echo "Error: No .mqsc files found in ./mqsc/${ENV}"
-            exit 1
-          fi
-```
+### Debugging Steps
 
-**Lines 54-62**: Loops through each MQSC file and checks for valid MQ commands (DEFINE, ALTER, DELETE, DISPLAY).
-```yaml
-          # Basic syntax validation (check for common MQSC commands)
-          for file in ./mqsc/${ENV}/*.mqsc; do
-            echo "Validating $(basename $file)..."
-            # Check for valid MQSC command structure
-            if ! grep -E "^(DEFINE|ALTER|DELETE|DISPLAY)" "$file" > /dev/null; then
-              echo "Warning: $file may not contain valid MQSC commands"
-            fi
-          done
-```
+1. **Check GitHub Actions logs** for detailed error messages
+2. **Verify MQSC file syntax** using dry-run mode
+3. **Confirm queue manager status** in Kubernetes
+4. **Review job logs** using kubectl commands above
+5. **Validate AWS/EKS connectivity** and permissions
 
-**Lines 64-71**: Creates unique job name using environment, timestamp, and GitHub run number.
-```yaml
-      - name: Generate unique job identifier
-        id: jobname
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          JOB_NAME="mq-config-${ENV}-${TIMESTAMP}-${{ github.run_number }}"
-          echo "name=$JOB_NAME" >> $GITHUB_OUTPUT
-          echo "Generated job name: $JOB_NAME"
-```
+## Security Considerations
 
-**Lines 73-79**: Generates 8-character hash of all MQSC files to track configuration changes.
-```yaml
-      - name: Generate config hash
-        id: hash
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          HASH=$(find ./mqsc/${ENV} -name '*.mqsc' -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1 | cut -c1-8)
-          echo "hash=$HASH" >> $GITHUB_OUTPUT
-          echo "Configuration hash: $HASH"
-```
+- **Secrets Management**: All sensitive data stored in GitHub Secrets
+- **RBAC**: Jobs run with minimal required permissions
+- **Network Isolation**: Jobs connect to MQ within cluster network
+- **Audit Trail**: Complete deployment history maintained in ConfigMaps
 
-## Job 2: Queue Deployment
+## Customization
 
-**Lines 81-84**: Second job that depends on validation, only runs if not in dry-run mode.
-```yaml
-  deploy-queues:
-    needs: validate-configs
-    runs-on: ubuntu-latest
-    if: github.event.inputs.dry_run != 'true'
-```
+### Extending the Workflow
 
-**Lines 91-97**: Installs AWS CLI if not already present.
-```yaml
-      - name: Setup AWS and kubectl
-        run: |
-          # Install AWS CLI
-          if ! command -v aws &> /dev/null; then
-            echo "Installing AWS CLI..."
-            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-            unzip -q awscliv2.zip
-            sudo ./aws/install
-          fi
-```
+To customize for your environment:
 
-**Lines 99-105**: Installs kubectl if not already present.
-```yaml
-          # Install kubectl
-          if ! command -v kubectl &> /dev/null; then
-            echo "Installing kubectl..."
-            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-            chmod +x kubectl
-            sudo mv kubectl /usr/local/bin/
-          fi
-```
+1. **Modify environment variables** in the workflow file
+2. **Adjust job specifications** (resources, timeouts, etc.)
+3. **Add custom validation steps** in the validation job
+4. **Implement custom notification** for deployment results
+5. **Add environment-specific configurations**
 
-**Lines 110-121**: Configures AWS credentials and updates kubeconfig for EKS cluster access.
-```yaml
-      - name: Configure AWS
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-        run: |
-          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
-          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
-          aws configure set region $AWS_DEFAULT_REGION
-          
-          aws sts get-caller-identity
-          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
-```
+### Adding New Environments
 
-**Lines 123-133**: Creates Kubernetes ConfigMap containing all MQSC files for the specific environment.
-```yaml
-      - name: Create ConfigMap for MQSC files
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          CONFIG_HASH="${{ needs.validate-configs.outputs.config-hash }}"
-          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
-          
-          # Create ConfigMap from MQSC files
-          kubectl create configmap ${JOB_NAME}-mqsc \
-            --from-file=./mqsc/${ENV}/ \
-            --namespace=${{ env.MQ_NAMESPACE }} \
-            --dry-run=client -o yaml | kubectl apply -f -
-```
+1. Create new directory under `mqsc/your-env/`
+2. Add environment option to workflow dispatch inputs
+3. Update any environment-specific logic if needed
 
-**Lines 135-141**: Adds standardized labels to the ConfigMap for organization and cleanup.
-```yaml
-          # Label the ConfigMap
-          kubectl label configmap ${JOB_NAME}-mqsc \
-            --namespace=${{ env.MQ_NAMESPACE }} \
-            app.kubernetes.io/name=mq-config-job \
-            app.kubernetes.io/environment=${ENV} \
-            app.kubernetes.io/version=${CONFIG_HASH} \
-            app.kubernetes.io/managed-by=github-actions
-```
+## Best Practices
 
-**Lines 143-149**: Begins creating the Kubernetes Job manifest file.
-```yaml
-      - name: Create and Apply MQ Configuration Job
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
-          
-          # Create the Job manifest
-          cat > /tmp/mq-config-job.yaml << EOF
-```
+- **Test in lower environments** before production deployment
+- **Keep MQSC files focused** (e.g., `app-queues.mqsc` for application queues, `queue-manager-config.mqsc` for QM settings)
+- **Use meaningful MQSC file names** that reflect their purpose
+- **Include REPLACE parameter** in DEFINE statements to handle updates safely
+- **Review deployment logs** regularly for early issue detection
+- **Maintain consistent naming conventions** across environments
+- **Use dry-run mode** for validation during development
 
-**Lines 150-164**: Defines Job metadata with labels and annotations tracking deployment details.
-```yaml
-          apiVersion: batch/v1
-          kind: Job
-          metadata:
-            name: ${JOB_NAME}
-            namespace: ${{ env.MQ_NAMESPACE }}
-            labels:
-              app.kubernetes.io/name: mq-config-job
-              app.kubernetes.io/environment: ${ENV}
-              app.kubernetes.io/managed-by: github-actions
-              app.kubernetes.io/version: ${{ needs.validate-configs.outputs.config-hash }}
-            annotations:
-              github.com/repository: ${{ github.repository }}
-              github.com/commit: ${{ github.sha }}
-              github.com/actor: ${{ github.actor }}
-              github.com/run-id: ${{ github.run_id }}
-```
+## Support
 
-**Lines 165-172**: Job specification with 5-minute cleanup timer, 2 retry attempts, and pod labels.
-```yaml
-          spec:
-            ttlSecondsAfterFinished: 300  # Clean up job after 5 minutes
-            backoffLimit: 2
-            template:
-              metadata:
-                labels:
-                  app.kubernetes.io/name: mq-config-job
-                  app.kubernetes.io/environment: ${ENV}
-```
+For issues related to:
+- **IBM MQ**: Consult IBM MQ documentation
+- **Kubernetes**: Check cluster and RBAC configurations  
+- **AWS EKS**: Verify cluster connectivity and permissions
+- **Workflow**: Review GitHub Actions logs and job outputs
 
-**Lines 173-179**: Pod specification with IBM MQ container image and bash command.
-```yaml
-              spec:
-                restartPolicy: Never
-                # serviceAccountName: mq-config-job-sa  # Optional - uses default SA if omitted
-                containers:
-                - name: mq-config
-                  image: ibmcom/mq:latest  # Use same image as your queue manager
-                  command: ["/bin/bash"]
-```
+## Contributing
 
-**Lines 181-186**: Bash script arguments with error handling and logging setup.
-```yaml
-                  args:
-                    - -c
-                    - |
-                      set -e
-                      echo "Starting MQ configuration job..."
-                      echo "Queue Manager: ${{ env.QMGR_NAME }}"
-                      echo "Environment: ${ENV}"
-```
-
-**Lines 188-194**: Waits for queue manager to be available before proceeding.
-```yaml
-                      # Wait for queue manager to be available
-                      echo "Waiting for queue manager to be ready..."
-                      until echo "DISPLAY QMGR" | runmqsc ${{ env.QMGR_NAME }} > /dev/null 2>&1; do
-                        echo "Queue manager not ready, waiting 10 seconds..."
-                        sleep 10
-                      done
-                      echo "Queue manager is ready!"
-```
-
-**Lines 196-207**: Executes each MQSC file against the queue manager.
-```yaml
-                      # Apply all MQSC files
-                      for mqsc_file in /mqsc-config/*.mqsc; do
-                        if [ -f "\$mqsc_file" ]; then
-                          echo "Applying \$(basename \$mqsc_file)..."
-                          if runmqsc ${{ env.QMGR_NAME }} < "\$mqsc_file"; then
-                            echo "Successfully applied \$(basename \$mqsc_file)"
-                          else
-                            echo "Failed to apply \$(basename \$mqsc_file)"
-                            exit 1
-                          fi
-                        fi
-                      done
-```
-
-**Lines 209-213**: Verifies the configuration by displaying all local queues.
-```yaml
-                      # Verify configuration
-                      echo "Verifying queue configuration..."
-                      echo "DISPLAY QLOCAL(*)" | runmqsc ${{ env.QMGR_NAME }}
-                      
-                      echo "MQ configuration job completed successfully!"
-```
-
-**Lines 214-218**: Sets required environment variables for the MQ container.
-```yaml
-                  env:
-                  - name: LICENSE
-                    value: accept
-                  - name: MQ_QMGR_NAME
-                    value: ${{ env.QMGR_NAME }}
-```
-
-**Lines 217-224**: Mounts ConfigMap with MQSC files and MQ data volume.
-```yaml
-                  volumeMounts:
-                  - name: mqsc-config
-                    mountPath: /mqsc-config
-                    readOnly: true
-                  # Connect to the same MQ network
-                  - name: mq-data
-                    mountPath: /mnt/mqm
-                    readOnly: true
-```
-
-**Lines 227-237**: Defines volumes and applies the Job to Kubernetes.
-```yaml
-                volumes:
-                - name: mqsc-config
-                  configMap:
-                    name: ${JOB_NAME}-mqsc
-                - name: mq-data
-                  persistentVolumeClaim:
-                    claimName: ${{ env.QMGR_NAME }}-pvc  # Adjust to match your PVC name
-          EOF
-          
-          # Apply the job
-          kubectl apply -f /tmp/mq-config-job.yaml
-```
-
-**Lines 239-248**: Waits up to 10 minutes for the Job to complete.
-```yaml
-      - name: Wait for Job Completion
-        run: |
-          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
-          
-          echo "Waiting for job ${JOB_NAME} to complete..."
-          
-          # Wait for job to complete (max 10 minutes)
-          kubectl wait --for=condition=Complete job/${JOB_NAME} \
-            --namespace=${{ env.MQ_NAMESPACE }} \
-            --timeout=600s
-```
-
-**Lines 250-259**: Checks final job status and exits with error if unsuccessful.
-```yaml
-          # Check job status
-          JOB_STATUS=$(kubectl get job ${JOB_NAME} -n ${{ env.MQ_NAMESPACE }} -o jsonpath='{.status.conditions[0].type}')
-          
-          if [ "$JOB_STATUS" = "Complete" ]; then
-            echo "Job completed successfully!"
-          else
-            echo "Job failed or did not complete"
-            kubectl describe job ${JOB_NAME} -n ${{ env.MQ_NAMESPACE }}
-            exit 1
-          fi
-```
-
-**Lines 261-270**: Always shows job logs and status for debugging, regardless of success/failure.
-```yaml
-      - name: Show Job Logs
-        if: always()
-        run: |
-          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
-          
-          echo "=== Job Logs ==="
-          kubectl logs job/${JOB_NAME} -n ${{ env.MQ_NAMESPACE }} || echo "No logs available"
-          
-          echo "=== Job Status ==="
-          kubectl describe job ${JOB_NAME} -n ${{ env.MQ_NAMESPACE }} || echo "Job not found"
-```
-
-**Lines 272-289**: Verifies deployment by connecting directly to the queue manager pod and listing queues.
-```yaml
-      - name: Verify Queue Configuration
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          
-          # Get the queue manager pod for verification
-          QM_POD=$(kubectl get pods -n ${{ env.MQ_NAMESPACE }} \
-            -l app.kubernetes.io/name=ibm-mq,app.kubernetes.io/instance=${{ env.QMGR_NAME }} \
-            -o jsonpath='{.items[0].metadata.name}')
-          
-          if [ -n "$QM_POD" ]; then
-            echo "Verifying configuration on queue manager pod: $QM_POD"
-            
-            # Simple verification - list queues
-            kubectl exec $QM_POD -n ${{ env.MQ_NAMESPACE }} -- \
-              bash -c "echo 'DISPLAY QLOCAL(*)' | runmqsc ${{ env.QMGR_NAME }}" || echo "Verification failed"
-          else
-            echo "Warning: Could not find queue manager pod for verification"
-          fi
-```
-
-**Lines 291-300**: Cleans up old ConfigMaps, keeping only the 5 most recent ones per environment.
-```yaml
-      - name: Cleanup ConfigMaps
-        if: always()
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          
-          # Keep only the 5 most recent job ConfigMaps
-          kubectl get configmaps -n ${{ env.MQ_NAMESPACE }} \
-            -l app.kubernetes.io/name=mq-config-job,app.kubernetes.io/environment=${ENV} \
-            --sort-by=.metadata.creationTimestamp \
-            -o name | head -n -5 | xargs -r kubectl delete -n ${{ env.MQ_NAMESPACE }} || echo "No old ConfigMaps to clean up"
-```
-
-**Lines 302-317**: Creates a deployment record ConfigMap with metadata about successful deployments.
-```yaml
-      - name: Record Deployment
-        if: success()
-        run: |
-          ENV="${{ github.event.inputs.environment || 'dev' }}"
-          CONFIG_HASH="${{ needs.validate-configs.outputs.config-hash }}"
-          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
-          
-          # Create a deployment record
-          kubectl create configmap deployment-record-$(date +%Y%m%d-%H%M%S) \
-            --from-literal=environment=${ENV} \
-            --from-literal=config-hash=${CONFIG_HASH} \
-            --from-literal=git-commit=${{ github.sha }} \
-            --from-literal=deployed-by=${{ github.actor }} \
-            --from-literal=job-name=${JOB_NAME} \
-            --namespace=${{ env.MQ_NAMESPACE }} \
-            --dry-run=client -o yaml | kubectl apply -f -
-```
-
-## Workflow Summary
-
-This workflow automates IBM MQ queue configuration deployment through a two-stage process:
-
-1. **Validation Stage**: Validates MQSC files, generates unique identifiers, and creates configuration hashes
-2. **Deployment Stage**: Creates Kubernetes Jobs that apply MQSC configurations to running MQ queue managers
-
-Key features include environment-specific deployments, dry-run capability, automatic cleanup, deployment tracking, and comprehensive logging for troubleshooting.
+1. Fork the repository
+2. Create a feature branch
+3. Test changes in development environment
+4. Submit pull request with clear description
+5. Ensure all checks pass before merging
