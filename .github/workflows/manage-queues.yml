@@ -1,10 +1,10 @@
-name: MQ Queue Management
-
+name: MQ Queue Management - Job Based
 on:
   push:
     branches: [main]
     paths:
       - 'mqsc/**/*.mqsc'
+      - 'k8s/jobs/**/*.yaml'
   workflow_dispatch:
     inputs:
       environment:
@@ -16,21 +16,79 @@ on:
           - dev
           - test
           - prod
+      dry_run:
+        description: 'Dry run (validate only)'
+        required: false
+        default: false
+        type: boolean
 
 env:
   MQ_NAMESPACE: ibm-mq-ns
   QMGR_NAME: secureapphelm
 
 jobs:
-  deploy-queues:
+  validate-configs:
     runs-on: ubuntu-latest
+    outputs:
+      config-hash: ${{ steps.hash.outputs.hash }}
+      job-name: ${{ steps.jobname.outputs.name }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+      
+      - name: Validate MQSC syntax
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          
+          # Validate MQSC files exist and have basic syntax
+          if [ ! -d "./mqsc/${ENV}" ]; then
+            echo "Error: No MQSC directory found for environment ${ENV}"
+            exit 1
+          fi
+          
+          # Check for MQSC files
+          if [ -z "$(find ./mqsc/${ENV} -name '*.mqsc' -type f)" ]; then
+            echo "Error: No .mqsc files found in ./mqsc/${ENV}"
+            exit 1
+          fi
+          
+          # Basic syntax validation (check for common MQSC commands)
+          for file in ./mqsc/${ENV}/*.mqsc; do
+            echo "Validating $(basename $file)..."
+            # Check for valid MQSC command structure
+            if ! grep -E "^(DEFINE|ALTER|DELETE|DISPLAY)" "$file" > /dev/null; then
+              echo "Warning: $file may not contain valid MQSC commands"
+            fi
+          done
+      
+      - name: Generate unique job identifier
+        id: jobname
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          JOB_NAME="mq-config-${ENV}-${TIMESTAMP}-${{ github.run_number }}"
+          echo "name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "Generated job name: $JOB_NAME"
+      
+      - name: Generate config hash
+        id: hash
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          HASH=$(find ./mqsc/${ENV} -name '*.mqsc' -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1 | cut -c1-8)
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+          echo "Configuration hash: $HASH"
+
+  deploy-queues:
+    needs: validate-configs
+    runs-on: ubuntu-latest
+    if: github.event.inputs.dry_run != 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       
       - name: Setup AWS and kubectl
         run: |
-          # Install AWS CLI if not present
+          # Install AWS CLI
           if ! command -v aws &> /dev/null; then
             echo "Installing AWS CLI..."
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -38,7 +96,7 @@ jobs:
             sudo ./aws/install
           fi
           
-          # Install kubectl if not present
+          # Install kubectl
           if ! command -v kubectl &> /dev/null; then
             echo "Installing kubectl..."
             curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -46,7 +104,6 @@ jobs:
             sudo mv kubectl /usr/local/bin/
           fi
           
-          # Verify installations
           aws --version
           kubectl version --client
       
@@ -56,36 +113,205 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          # Configure AWS credentials
           aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
           aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
           aws configure set region $AWS_DEFAULT_REGION
           
-          # Verify configuration
           aws sts get-caller-identity
-          
-          # Update kubeconfig
           aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
       
-      - name: Get MQ Pod
+      - name: Create ConfigMap for MQSC files
         run: |
-          MQ_POD=$(kubectl get pods -n ${{ env.MQ_NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
-          echo "MQ_POD=$MQ_POD" >> $GITHUB_ENV
-          echo "Found pod: $MQ_POD"
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          CONFIG_HASH="${{ needs.validate-configs.outputs.config-hash }}"
+          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
+          
+          # Create ConfigMap from MQSC files
+          kubectl create configmap ${JOB_NAME}-mqsc \
+            --from-file=./mqsc/${ENV}/ \
+            --namespace=${{ env.MQ_NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Label the ConfigMap
+          kubectl label configmap ${JOB_NAME}-mqsc \
+            --namespace=${{ env.MQ_NAMESPACE }} \
+            app.kubernetes.io/name=mq-config-job \
+            app.kubernetes.io/environment=${ENV} \
+            app.kubernetes.io/version=${CONFIG_HASH} \
+            app.kubernetes.io/managed-by=github-actions
       
-      - name: Apply Queues
+      - name: Create and Apply MQ Configuration Job
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
+          
+          # Create the Job manifest
+          cat > /tmp/mq-config-job.yaml << EOF
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: ${{ env.MQ_NAMESPACE }}
+            labels:
+              app.kubernetes.io/name: mq-config-job
+              app.kubernetes.io/environment: ${ENV}
+              app.kubernetes.io/managed-by: github-actions
+              app.kubernetes.io/version: ${{ needs.validate-configs.outputs.config-hash }}
+            annotations:
+              github.com/repository: ${{ github.repository }}
+              github.com/commit: ${{ github.sha }}
+              github.com/actor: ${{ github.actor }}
+              github.com/run-id: ${{ github.run_id }}
+          spec:
+            ttlSecondsAfterFinished: 300  # Clean up job after 5 minutes
+            backoffLimit: 2
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: mq-config-job
+                  app.kubernetes.io/environment: ${ENV}
+              spec:
+                restartPolicy: Never
+                # serviceAccountName: mq-config-job-sa  # Optional - uses default SA if omitted
+                containers:
+                - name: mq-config
+                  image: ibmcom/mq:latest  # Use same image as your queue manager
+                  command: ["/bin/bash"]
+                  args:
+                    - -c
+                    - |
+                      set -e
+                      echo "Starting MQ configuration job..."
+                      echo "Queue Manager: ${{ env.QMGR_NAME }}"
+                      echo "Environment: ${ENV}"
+                      
+                      # Wait for queue manager to be available
+                      echo "Waiting for queue manager to be ready..."
+                      until echo "DISPLAY QMGR" | runmqsc ${{ env.QMGR_NAME }} > /dev/null 2>&1; do
+                        echo "Queue manager not ready, waiting 10 seconds..."
+                        sleep 10
+                      done
+                      echo "Queue manager is ready!"
+                      
+                      # Apply all MQSC files
+                      for mqsc_file in /mqsc-config/*.mqsc; do
+                        if [ -f "\$mqsc_file" ]; then
+                          echo "Applying \$(basename \$mqsc_file)..."
+                          if runmqsc ${{ env.QMGR_NAME }} < "\$mqsc_file"; then
+                            echo "Successfully applied \$(basename \$mqsc_file)"
+                          else
+                            echo "Failed to apply \$(basename \$mqsc_file)"
+                            exit 1
+                          fi
+                        fi
+                      done
+                      
+                      # Verify configuration
+                      echo "Verifying queue configuration..."
+                      echo "DISPLAY QLOCAL(*)" | runmqsc ${{ env.QMGR_NAME }}
+                      
+                      echo "MQ configuration job completed successfully!"
+                  env:
+                  - name: LICENSE
+                    value: accept
+                  - name: MQ_QMGR_NAME
+                    value: ${{ env.QMGR_NAME }}
+                  volumeMounts:
+                  - name: mqsc-config
+                    mountPath: /mqsc-config
+                    readOnly: true
+                  # Connect to the same MQ network
+                  - name: mq-data
+                    mountPath: /mnt/mqm
+                    readOnly: true
+                volumes:
+                - name: mqsc-config
+                  configMap:
+                    name: ${JOB_NAME}-mqsc
+                - name: mq-data
+                  persistentVolumeClaim:
+                    claimName: ${{ env.QMGR_NAME }}-pvc  # Adjust to match your PVC name
+          EOF
+          
+          # Apply the job
+          kubectl apply -f /tmp/mq-config-job.yaml
+      
+      - name: Wait for Job Completion
+        run: |
+          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
+          
+          echo "Waiting for job ${JOB_NAME} to complete..."
+          
+          # Wait for job to complete (max 10 minutes)
+          kubectl wait --for=condition=Complete job/${JOB_NAME} \
+            --namespace=${{ env.MQ_NAMESPACE }} \
+            --timeout=600s
+          
+          # Check job status
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -n ${{ env.MQ_NAMESPACE }} -o jsonpath='{.status.conditions[0].type}')
+          
+          if [ "$JOB_STATUS" = "Complete" ]; then
+            echo "Job completed successfully!"
+          else
+            echo "Job failed or did not complete"
+            kubectl describe job ${JOB_NAME} -n ${{ env.MQ_NAMESPACE }}
+            exit 1
+          fi
+      
+      - name: Show Job Logs
+        if: always()
+        run: |
+          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
+          
+          echo "=== Job Logs ==="
+          kubectl logs job/${JOB_NAME} -n ${{ env.MQ_NAMESPACE }} || echo "No logs available"
+          
+          echo "=== Job Status ==="
+          kubectl describe job ${JOB_NAME} -n ${{ env.MQ_NAMESPACE }} || echo "Job not found"
+      
+      - name: Verify Queue Configuration
         run: |
           ENV="${{ github.event.inputs.environment || 'dev' }}"
           
-          for mqsc_file in ./mqsc/${ENV}/*.mqsc; do
-            echo "Applying $(basename $mqsc_file)..."
-            kubectl exec -i ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- \
-              runmqsc ${{ env.QMGR_NAME }} < "$mqsc_file"
-          done
+          # Get the queue manager pod for verification
+          QM_POD=$(kubectl get pods -n ${{ env.MQ_NAMESPACE }} \
+            -l app.kubernetes.io/name=ibm-mq,app.kubernetes.io/instance=${{ env.QMGR_NAME }} \
+            -o jsonpath='{.items[0].metadata.name}')
+          
+          if [ -n "$QM_POD" ]; then
+            echo "Verifying configuration on queue manager pod: $QM_POD"
+            
+            # Simple verification - list queues
+            kubectl exec $QM_POD -n ${{ env.MQ_NAMESPACE }} -- \
+              bash -c "echo 'DISPLAY QLOCAL(*)' | runmqsc ${{ env.QMGR_NAME }}" || echo "Verification failed"
+          else
+            echo "Warning: Could not find queue manager pod for verification"
+          fi
       
-      - name: List Queues
+      - name: Cleanup ConfigMaps
         if: always()
         run: |
-          echo "Current queues:"
-          kubectl exec -i ${{ env.MQ_POD }} -n ${{ env.MQ_NAMESPACE }} -- \
-            bash -c "echo 'DISPLAY QLOCAL(*)' | runmqsc ${{ env.QMGR_NAME }}" || true
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          
+          # Keep only the 5 most recent job ConfigMaps
+          kubectl get configmaps -n ${{ env.MQ_NAMESPACE }} \
+            -l app.kubernetes.io/name=mq-config-job,app.kubernetes.io/environment=${ENV} \
+            --sort-by=.metadata.creationTimestamp \
+            -o name | head -n -5 | xargs -r kubectl delete -n ${{ env.MQ_NAMESPACE }} || echo "No old ConfigMaps to clean up"
+      
+      - name: Record Deployment
+        if: success()
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          CONFIG_HASH="${{ needs.validate-configs.outputs.config-hash }}"
+          JOB_NAME="${{ needs.validate-configs.outputs.job-name }}"
+          
+          # Create a deployment record
+          kubectl create configmap deployment-record-$(date +%Y%m%d-%H%M%S) \
+            --from-literal=environment=${ENV} \
+            --from-literal=config-hash=${CONFIG_HASH} \
+            --from-literal=git-commit=${{ github.sha }} \
+            --from-literal=deployed-by=${{ github.actor }} \
+            --from-literal=job-name=${JOB_NAME} \
+            --namespace=${{ env.MQ_NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
